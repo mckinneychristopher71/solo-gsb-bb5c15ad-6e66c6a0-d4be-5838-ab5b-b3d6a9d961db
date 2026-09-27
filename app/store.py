@@ -710,14 +710,22 @@ def _stored_to_batch(stored: dict) -> list[dict]:
     ]
 
 
-def _get_draft_rows(merge_id: str, draft_id: str):
-    """Fetch (merge_row, draft_row) or raise MergeNotFound / DraftNotFound."""
-    merge_row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
+def _fetch_draft_rows(conn, merge_id: str, draft_id: str):
+    """Fetch (merge_row, draft_row) on the caller's connection/snapshot.
+
+    Both reads run on ``conn``, so inside a ``db.transaction`` they see the
+    writer's own uncommitted state and inside a ``db.read_snapshot`` they
+    share one snapshot — merge lookup and draft lookup can never straddle a
+    concurrent commit. Raises MergeNotFound / DraftNotFound.
+    """
+    merge_row = conn.execute(
+        "SELECT * FROM merges WHERE id = ?", (merge_id,)
+    ).fetchone()
     if merge_row is None:
         raise MergeNotFound(merge_id)
-    draft_row = db.query_one(
+    draft_row = conn.execute(
         "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
-    )
+    ).fetchone()
     if draft_row is None or draft_row["merge_id"] != merge_id:
         raise DraftNotFound(draft_id)
     return merge_row, draft_row
@@ -727,57 +735,66 @@ def create_draft(merge_id: str) -> dict:
     """Open a resolution draft pinned to the merge's current revision.
 
     The draft snapshots the working document and the open conflicts, so
-    later edits and previews are stable even if the merge moves on. Only a
-    pending merge accepts drafts; a resolved one yields AlreadyResolved.
+    later edits and previews are stable even if the merge moves on. The
+    pending-status check and the insert run in one transaction, so a
+    resolution committing the merge concurrently cannot interleave between
+    the check and the row. Only a pending merge accepts drafts; a resolved
+    one yields AlreadyResolved.
     """
-    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
-    if row is None:
-        raise MergeNotFound(merge_id)
-    if row["status"] == STATUS_RESOLVED:
-        raise AlreadyResolved(merge_id)
-    draft_id = uuid.uuid4().hex
-    now = _now()
-    db.execute(
-        """
-        INSERT INTO merge_drafts (
-            id, merge_id, status, base_revision,
-            document, conflicts, resolutions, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            draft_id,
-            merge_id,
-            DRAFT_OPEN,
-            row["revision"],
-            row["document"],
-            row["conflicts"],
-            "{}",
-            now,
-            now,
-        ),
-    )
-    return get_draft(merge_id, draft_id)
-
-
-def get_draft(merge_id: str, draft_id: str) -> dict:
-    _, draft_row = _get_draft_rows(merge_id, draft_id)
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        if row is None:
+            raise MergeNotFound(merge_id)
+        if row["status"] == STATUS_RESOLVED:
+            raise AlreadyResolved(merge_id)
+        draft_id = uuid.uuid4().hex
+        now = _now()
+        conn.execute(
+            """
+            INSERT INTO merge_drafts (
+                id, merge_id, status, base_revision,
+                document, conflicts, resolutions, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                draft_id,
+                merge_id,
+                DRAFT_OPEN,
+                row["revision"],
+                row["document"],
+                row["conflicts"],
+                "{}",
+                now,
+                now,
+            ),
+        )
+        draft_row = conn.execute(
+            "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
     return _draft_row_to_dict(draft_row)
 
 
-def update_draft(merge_id: str, draft_id: str, items: list[dict]) -> dict:
-    """Append or overwrite conflict resolutions on the draft.
+def get_draft(merge_id: str, draft_id: str) -> dict:
+    # One read-only snapshot: the returned view is always a single persisted
+    # draft state, never a mix of states from either side of a commit.
+    with db.read_snapshot() as conn:
+        _, draft_row = _fetch_draft_rows(conn, merge_id, draft_id)
+    return _draft_row_to_dict(draft_row)
 
-    Each item follows the same choice/value semantics as a resolution
-    batch: exactly one of 'choice' / 'value' (an explicit null counts as
-    'value'). A pointer already present in the draft is overwritten in
-    place; a new one is appended. Only the draft row is written — the
-    merge order is never touched by draft edits.
+
+def _validate_draft_items(items: list[dict], open_pointers: set[str]) -> dict:
+    """Validate a draft edit batch in memory; return pointer -> entry.
+
+    Every item is checked before anything is persisted, so a batch
+    containing an invalid item is rejected as a whole. Each item follows
+    the resolution batch semantics: exactly one of 'choice' / 'value' (an
+    explicit null counts as 'value'), and its pointer must still be one of
+    the draft's pinned open conflicts. A repeated pointer within the batch
+    keeps its first position but ends with the last item's decision.
     """
-    _, draft_row = _get_draft_rows(merge_id, draft_id)
-    if draft_row["status"] != DRAFT_OPEN:
-        raise DraftNotOpen(draft_id)
-    open_pointers = {c["pointer"] for c in json.loads(draft_row["conflicts"])}
-    stored = json.loads(draft_row["resolutions"])
+    normalized: dict[str, dict] = {}
     for item in items:
         pointer = item["pointer"]
         if pointer not in open_pointers:
@@ -791,14 +808,59 @@ def update_draft(merge_id: str, draft_id: str, items: list[dict]) -> dict:
                 f"resolution for {pointer!r} needs 'choice' or 'value'"
             )
         if item.get("choice") is not None:
-            stored[pointer] = {"choice": item["choice"]}
+            normalized[pointer] = {"choice": item["choice"]}
         else:
-            stored[pointer] = {"value": item["value"]}
-    db.execute(
-        "UPDATE merge_drafts SET resolutions = ?, updated_at = ? WHERE id = ?",
-        (json.dumps(stored), _now(), draft_id),
-    )
-    return get_draft(merge_id, draft_id)
+            normalized[pointer] = {"value": item["value"]}
+    return normalized
+
+
+def update_draft(merge_id: str, draft_id: str, items: list[dict]) -> dict:
+    """Append or overwrite conflict resolutions on the draft.
+
+    The draft row is read, checked open, validated against and merged with
+    the new batch, and written back inside a single SQLite transaction.
+    Concurrent edits therefore serialize on the write lock: each one reads
+    the previous edit's committed ``resolutions`` and merges into it, so
+    valid edits to distinct pointers are all retained instead of the later
+    write clobbering the earlier one; edits to the same pointer are taken
+    by the later transaction in commit order. A batch containing any
+    invalid item aborts the transaction and writes nothing. An edit that
+    races a commit sees the draft's committed status inside the same
+    transaction and is rejected (DraftNotOpen); the guarded UPDATE makes
+    reopening/rewriting a committed draft impossible. Only the draft row
+    is written — the merge order is never touched by draft edits.
+    """
+    with db.transaction() as conn:
+        _, draft_row = _fetch_draft_rows(conn, merge_id, draft_id)
+        if draft_row["status"] != DRAFT_OPEN:
+            raise DraftNotOpen(draft_id)
+        open_pointers = {
+            c["pointer"] for c in json.loads(draft_row["conflicts"])
+        }
+        # Validate the whole batch before mutating stored state; a raise
+        # rolls the transaction back, so no item of a bad batch persists.
+        normalized = _validate_draft_items(items, open_pointers)
+
+        stored = json.loads(draft_row["resolutions"])
+        # Distinct pointers are appended, an already-present pointer is
+        # overwritten in place. This read-merge-write happens entirely
+        # within the transaction, so another edit cannot interleave.
+        stored.update(normalized)
+        now = _now()
+        cursor = conn.execute(
+            "UPDATE merge_drafts SET resolutions = ?, updated_at = ? "
+            "WHERE id = ? AND status = ?",
+            (json.dumps(stored), now, draft_id, DRAFT_OPEN),
+        )
+        # Defense in depth: even though the open check above and this
+        # UPDATE share the same serialized transaction, the status guard
+        # makes writing a committed draft impossible outright.
+        if cursor.rowcount == 0:
+            raise DraftNotOpen(draft_id)
+        updated_row = conn.execute(
+            "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+    return _draft_row_to_dict(updated_row)
 
 
 def preview_draft(merge_id: str, draft_id: str) -> dict:
@@ -812,37 +874,48 @@ def preview_draft(merge_id: str, draft_id: str) -> dict:
     the commit uses — a draft the commit would reject (422) fails the
     preview identically — and the deterministic base-to-result patch and
     its SHA-256 are included, mirroring the resolution-preview endpoint.
+
+    The merge and draft rows are read on one read-only snapshot, so the
+    preview's pinned draft content, current revision and schema gate all
+    come from the same persisted state; a commit landing during the
+    request cannot mix an old merge revision with a new draft (or vice
+    versa). Nothing is written.
     """
-    merge_row, draft_row = _get_draft_rows(merge_id, draft_id)
-    if draft_row["status"] != DRAFT_OPEN:
-        raise DraftNotOpen(draft_id)
-    document, remaining = _apply_batch(
-        json.loads(draft_row["document"]),
-        json.loads(draft_row["conflicts"]),
-        _stored_to_batch(json.loads(draft_row["resolutions"])),
-    )
-    would_resolve = not remaining
-    if would_resolve and merge_row["result_schema"] is not None:
-        # Same Draft 2020-12 gate as the draft commit: a draft that would
-        # resolve the last conflict must yield a final document satisfying
-        # result_schema, otherwise the preview fails with the very 422
-        # error list the commit would return instead of falsely reporting
-        # would_resolve. A partial draft is never validated, exactly like
-        # a partial commit. The preview writes nothing either way, so a
-        # failed gate leaves the merge, the draft and the audit trail
-        # untouched.
-        validate_result(json.loads(merge_row["result_schema"]), document)
+    with db.read_snapshot() as conn:
+        merge_row, draft_row = _fetch_draft_rows(conn, merge_id, draft_id)
+        if draft_row["status"] != DRAFT_OPEN:
+            raise DraftNotOpen(draft_id)
+        document, remaining = _apply_batch(
+            json.loads(draft_row["document"]),
+            json.loads(draft_row["conflicts"]),
+            _stored_to_batch(json.loads(draft_row["resolutions"])),
+        )
+        would_resolve = not remaining
+        result_schema = merge_row["result_schema"]
+        base_revision = draft_row["base_revision"]
+        current_revision = merge_row["revision"]
+        base_doc = merge_row["base_doc"]
+        if would_resolve and result_schema is not None:
+            # Same Draft 2020-12 gate as the draft commit: a draft that would
+            # resolve the last conflict must yield a final document satisfying
+            # result_schema, otherwise the preview fails with the very 422
+            # error list the commit would return instead of falsely reporting
+            # would_resolve. A partial draft is never validated, exactly like
+            # a partial commit. The snapshot connection writes nothing, so a
+            # failed gate leaves the merge, the draft and the audit trail
+            # untouched.
+            validate_result(json.loads(result_schema), document)
     preview = {
         "merge_id": merge_id,
         "draft_id": draft_id,
-        "base_revision": draft_row["base_revision"],
-        "current_revision": merge_row["revision"],
+        "base_revision": base_revision,
+        "current_revision": current_revision,
         "document": document,
         "remaining_conflicts": remaining,
         "would_resolve": would_resolve,
     }
     if would_resolve:
-        base = json.loads(merge_row["base_doc"])
+        base = json.loads(base_doc)
         preview["patch"] = generate_patch(base, document)
         preview["result_sha256"] = sha256_hex(document)
     return preview
@@ -861,12 +934,7 @@ def commit_draft(merge_id: str, draft_id: str) -> dict:
     applied with exactly one revision bump and the draft is invalidated.
     """
     with db.transaction() as conn:
-        merge_row = _fetch_merge_row(conn, merge_id)
-        draft_row = conn.execute(
-            "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
-        ).fetchone()
-        if draft_row is None or draft_row["merge_id"] != merge_id:
-            raise DraftNotFound(draft_id)
+        merge_row, draft_row = _fetch_draft_rows(conn, merge_id, draft_id)
         if draft_row["status"] != DRAFT_OPEN:
             raise DraftNotOpen(draft_id)
         _require_pending_at_revision(merge_row, draft_row["base_revision"])

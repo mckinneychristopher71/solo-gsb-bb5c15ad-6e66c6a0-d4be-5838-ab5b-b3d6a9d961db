@@ -9,12 +9,14 @@ then every value is applied at once and the draft is invalidated.
 
 import os
 import tempfile
+import threading
 
 os.environ["DATABASE_PATH"] = os.path.join(tempfile.mkdtemp(), "test_drafts.db")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import store  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -497,3 +499,230 @@ def test_draft_commit_uses_creation_snapshot_for_delete_semantics(client):
     resp = client.post(f"/merges/{mid}/drafts/{did}/commit")
     assert resp.status_code == 200, resp.text
     assert resp.json()["result"] == {"b": 2}
+
+
+# ---------------------------------------------------------------------------
+# Concurrent draft edits: read/check/merge/write must be one transaction
+#
+# Two requests appending different conflict pointers used to read the whole
+# resolutions column outside the write lock and write it back separately, so
+# the later write clobbered the earlier one (a lost adjudication). An edit
+# interleaved with a commit could also rewrite a draft the commit had just
+# invalidated. The store layer now runs read, open-status guard, pointer
+# validation, merge and write inside one transaction, so concurrent edits
+# serialize and committed drafts refuse edits.
+# ---------------------------------------------------------------------------
+
+
+def _value_item(pointer, value):
+    return {"pointer": pointer, "value": value, "value_provided": True}
+
+
+def _choice_item(pointer, side):
+    return {"pointer": pointer, "choice": side, "value_provided": False}
+
+
+def _run_concurrently(*fns):
+    """Start every fn on an event barrier so they race into the lock together."""
+    barrier = threading.Barrier(len(fns))
+    errors = []
+
+    def runner(fn):
+        try:
+            barrier.wait()
+            fn()
+        except Exception as exc:  # pragma: no cover - surfaced via assert below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=runner, args=(fn,)) for fn in fns]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return errors
+
+
+def test_concurrent_edits_with_different_pointers_both_survive(client):
+    merge = create_merge(client)
+    mid = merge["merge_id"]
+    did = create_draft(client, mid)["draft_id"]
+
+    errors = _run_concurrently(
+        lambda: store.update_draft(mid, did, [_choice_item("/a", "left")]),
+        lambda: store.update_draft(mid, did, [_value_item("/b", 20)]),
+        lambda: store.update_draft(mid, did, [_choice_item("/c", "right")]),
+    )
+    assert errors == []
+    assert sorted(
+        r["pointer"] for r in store.get_draft(mid, did)["resolutions"]
+    ) == ["/a", "/b", "/c"]
+    # Each surviving adjudication keeps its own value.
+    by_pointer = {r["pointer"]: r for r in store.get_draft(mid, did)["resolutions"]}
+    assert by_pointer["/a"] == {"pointer": "/a", "choice": "left"}
+    assert by_pointer["/b"] == {"pointer": "/b", "value": 20}
+    assert by_pointer["/c"] == {"pointer": "/c", "choice": "right"}
+    # Draft-only edits never touch the merge order.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1 and fetched["status"] == "pending"
+
+
+def test_repeated_concurrent_edits_never_lose_an_adjudication(client):
+    # Hammer the same draft from two threads over many fresh drafts: with the
+    # old lock-outside read/write flow one pointer vanished most of the time.
+    merge = create_merge(client)
+    mid = merge["merge_id"]
+    for _ in range(25):
+        did = create_draft(client, mid)["draft_id"]
+        errors = _run_concurrently(
+            lambda: store.update_draft(mid, did, [_choice_item("/a", "left")]),
+            lambda: store.update_draft(mid, did, [_value_item("/c", 9)]),
+        )
+        assert errors == []
+        assert {
+            r["pointer"] for r in store.get_draft(mid, did)["resolutions"]
+        } == {"/a", "/c"}
+
+
+def test_concurrent_edits_to_same_pointer_last_transaction_wins(client):
+    merge = create_merge(client)
+    mid = merge["merge_id"]
+    did = create_draft(client, mid)["draft_id"]
+
+    views = {}
+
+    def take_left():
+        views["left"] = store.update_draft(mid, did, [_choice_item("/a", "left")])
+
+    def take_right():
+        views["right"] = store.update_draft(mid, did, [_choice_item("/a", "right")])
+
+    errors = _run_concurrently(take_left, take_right)
+    assert errors == []
+    resolutions = store.get_draft(mid, did)["resolutions"]
+    # Exactly one entry for the pointer; the later transaction overwrites.
+    assert len(resolutions) == 1
+    assert resolutions[0]["pointer"] == "/a"
+    assert resolutions[0]["choice"] in ("left", "right")
+    # The persisted value agrees with whichever edit committed last.
+    assert resolutions == views["left"]["resolutions"] or resolutions == views[
+        "right"
+    ]["resolutions"]
+
+
+def test_invalid_item_in_concurrent_batch_writes_nothing(client):
+    merge = create_merge(client)
+    mid = merge["merge_id"]
+    did = create_draft(client, mid)["draft_id"]
+    store.update_draft(mid, did, [_choice_item("/a", "left")])
+
+    # The bad batch runs concurrently with a good edit to another pointer.
+    # The good edit survives; the invalid batch is rolled back entirely
+    # (its valid sibling /b must not appear either).
+    caught = []
+
+    def bad_batch():
+        try:
+            store.update_draft(
+                mid, did,
+                [_choice_item("/b", "right"), _value_item("/missing", 1)],
+            )
+        except store.UnknownConflictPointer as exc:
+            caught.append(exc)
+
+    errors = _run_concurrently(
+        bad_batch,
+        lambda: store.update_draft(mid, did, [_value_item("/c", 7)]),
+    )
+    assert errors == []
+    assert len(caught) == 1
+    assert caught[0].pointer == "/missing"
+    assert sorted(
+        r["pointer"] for r in store.get_draft(mid, did)["resolutions"]
+    ) == ["/a", "/c"]
+
+
+def test_edit_racing_a_commit_never_rewrites_committed_draft(client):
+    # A draft resolving /a and /b commits while another thread edits /c.
+    # Whichever transaction wins the serialization, the committed draft is
+    # never rewritten or reopened, and the merge/audit state is consistent.
+    for _ in range(15):
+        merge = create_merge(client)
+        mid = merge["merge_id"]
+        did = create_draft(client, mid)["draft_id"]
+        store.update_draft(
+            mid, did,
+            [_choice_item("/a", "left"), _choice_item("/b", "left")],
+        )
+
+        def commit():
+            store.commit_draft(mid, did)
+
+        def edit():
+            try:
+                store.update_draft(mid, did, [_value_item("/c", 123)])
+            except store.DraftNotOpen:
+                # The commit won the race: the edit must be refused.
+                pass
+
+        errors = _run_concurrently(commit, edit)
+        # The edit swallows the expected DraftNotOpen; any captured error
+        # here is genuinely unexpected.
+        assert errors == []
+
+        draft = client.get(f"/merges/{mid}/drafts/{did}").json()
+        assert draft["status"] == "committed"
+        fetched = client.get(f"/merges/{mid}").json()
+        audit = client.get(f"/merges/{mid}/audit").json()
+        assert audit["chain_valid"] is True
+        pointers = sorted(audit["events"][-1]["pointers"])
+        if pointers == ["/a", "/b", "/c"]:
+            # Edit committed first: the commit applied the completed draft.
+            assert fetched["status"] == "resolved"
+            assert fetched["result"] == {"a": 2, "b": 2, "c": 123}
+            assert sorted(r["pointer"] for r in draft["resolutions"]) == [
+                "/a",
+                "/b",
+                "/c",
+            ]
+        else:
+            # Commit committed first (partial): the late edit was refused and
+            # the committed draft's stored pointers are exactly /a,/b.
+            assert pointers == ["/a", "/b"]
+            assert fetched["revision"] == 2
+            assert sorted(r["pointer"] for r in draft["resolutions"]) == [
+                "/a",
+                "/b",
+            ]
+
+
+def test_committed_draft_rejects_edit_preview_and_commit_under_race(client):
+    # After a commit, a late edit must fail DraftNotOpen (409) even if it had
+    # read the draft row while it was still open: the status guard inside the
+    # write transaction rejects it.
+    merge = create_merge(client)
+    mid = merge["merge_id"]
+    did = create_draft(client, mid)["draft_id"]
+    store.update_draft(
+        mid,
+        did,
+        [
+            _choice_item("/a", "left"),
+            _value_item("/b", 20),
+            _choice_item("/c", "right"),
+        ],
+    )
+    store.commit_draft(mid, did)
+
+    for fn in (
+        lambda: store.update_draft(mid, did, [_value_item("/a", 0)]),
+        lambda: store.preview_draft(mid, did),
+        lambda: store.commit_draft(mid, did),
+    ):
+        with pytest.raises(store.DraftNotOpen):
+            fn()
+    # The rejected edit left no trace on the immutable result.
+    assert client.get(f"/merges/{mid}").json()["result"] == {
+        "a": 2,
+        "b": 20,
+        "c": 3,
+    }
