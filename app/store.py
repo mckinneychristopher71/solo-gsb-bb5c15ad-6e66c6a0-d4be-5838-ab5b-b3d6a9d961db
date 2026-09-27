@@ -711,13 +711,40 @@ def _stored_to_batch(stored: dict) -> list[dict]:
 
 
 def _get_draft_rows(merge_id: str, draft_id: str):
-    """Fetch (merge_row, draft_row) or raise MergeNotFound / DraftNotFound."""
-    merge_row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
+    """Fetch (merge_row, draft_row) or raise MergeNotFound / DraftNotFound.
+
+    Both rows come from one read-only snapshot transaction, so a draft
+    query or preview can never pair one version of the merge row with a
+    different (concurrently committed) version of the draft row.
+    """
+    with db.read_snapshot() as conn:
+        merge_row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        draft_row = conn.execute(
+            "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
     if merge_row is None:
         raise MergeNotFound(merge_id)
-    draft_row = db.query_one(
+    if draft_row is None or draft_row["merge_id"] != merge_id:
+        raise DraftNotFound(draft_id)
+    return merge_row, draft_row
+
+
+def _fetch_draft_rows(conn, merge_id: str, draft_id: str):
+    """Fetch (merge_row, draft_row) inside the caller's write transaction.
+
+    Raises MergeNotFound (404) for an unknown merge and DraftNotFound (404)
+    for an unknown draft or a draft reached through another merge's URL.
+    """
+    merge_row = conn.execute(
+        "SELECT * FROM merges WHERE id = ?", (merge_id,)
+    ).fetchone()
+    if merge_row is None:
+        raise MergeNotFound(merge_id)
+    draft_row = conn.execute(
         "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
-    )
+    ).fetchone()
     if draft_row is None or draft_row["merge_id"] != merge_id:
         raise DraftNotFound(draft_id)
     return merge_row, draft_row
@@ -727,36 +754,48 @@ def create_draft(merge_id: str) -> dict:
     """Open a resolution draft pinned to the merge's current revision.
 
     The draft snapshots the working document and the open conflicts, so
-    later edits and previews are stable even if the merge moves on. Only a
-    pending merge accepts drafts; a resolved one yields AlreadyResolved.
+    later edits and previews are stable even if the merge moves on. The
+    pending check, the snapshot copy and the insert run in one transaction,
+    so a merge resolved by another request in between cannot be snapshotted
+    as a draft. Only a pending merge accepts drafts; a resolved one yields
+    AlreadyResolved.
     """
-    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
-    if row is None:
-        raise MergeNotFound(merge_id)
-    if row["status"] == STATUS_RESOLVED:
-        raise AlreadyResolved(merge_id)
-    draft_id = uuid.uuid4().hex
-    now = _now()
-    db.execute(
-        """
-        INSERT INTO merge_drafts (
-            id, merge_id, status, base_revision,
-            document, conflicts, resolutions, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            draft_id,
-            merge_id,
-            DRAFT_OPEN,
-            row["revision"],
-            row["document"],
-            row["conflicts"],
-            "{}",
-            now,
-            now,
-        ),
-    )
-    return get_draft(merge_id, draft_id)
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        if row is None:
+            raise MergeNotFound(merge_id)
+        if row["status"] == STATUS_RESOLVED:
+            raise AlreadyResolved(merge_id)
+        draft_id = uuid.uuid4().hex
+        now = _now()
+        conn.execute(
+            """
+            INSERT INTO merge_drafts (
+                id, merge_id, status, base_revision,
+                document, conflicts, resolutions, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                draft_id,
+                merge_id,
+                DRAFT_OPEN,
+                row["revision"],
+                row["document"],
+                row["conflicts"],
+                "{}",
+                now,
+                now,
+            ),
+        )
+        # Build the response from the row just inserted, in the same
+        # transaction, so it is exactly what was persisted.
+        draft_row = conn.execute(
+            "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        view = _draft_row_to_dict(draft_row)
+    return view
 
 
 def get_draft(merge_id: str, draft_id: str) -> dict:
@@ -772,33 +811,59 @@ def update_draft(merge_id: str, draft_id: str, items: list[dict]) -> dict:
     'value'). A pointer already present in the draft is overwritten in
     place; a new one is appended. Only the draft row is written — the
     merge order is never touched by draft edits.
+
+    The draft row is read, checked open, validated against its own
+    conflict snapshot, merged and written back inside one transaction.
+    Concurrent edits therefore serialize on the stored state: edits for
+    different pointers all survive, and the same pointer resolves in
+    transaction order with the later edit winning. A commit landing first
+    flips the draft to 'committed' in the same transaction as the merge
+    update, so an interleaved edit sees that status and is rejected.
+    Every item in a batch is validated before the merge, so an invalid
+    item rolls the whole batch back and the draft is left byte-for-byte
+    unchanged.
     """
-    _, draft_row = _get_draft_rows(merge_id, draft_id)
-    if draft_row["status"] != DRAFT_OPEN:
-        raise DraftNotOpen(draft_id)
-    open_pointers = {c["pointer"] for c in json.loads(draft_row["conflicts"])}
-    stored = json.loads(draft_row["resolutions"])
-    for item in items:
-        pointer = item["pointer"]
-        if pointer not in open_pointers:
-            raise UnknownConflictPointer(pointer)
-        if item.get("choice") is not None and item.get("value_provided"):
-            raise InvalidResolution(
-                f"resolution for {pointer!r} gives both 'choice' and 'value'"
-            )
-        if item.get("choice") is None and not item.get("value_provided"):
-            raise InvalidResolution(
-                f"resolution for {pointer!r} needs 'choice' or 'value'"
-            )
-        if item.get("choice") is not None:
-            stored[pointer] = {"choice": item["choice"]}
-        else:
-            stored[pointer] = {"value": item["value"]}
-    db.execute(
-        "UPDATE merge_drafts SET resolutions = ?, updated_at = ? WHERE id = ?",
-        (json.dumps(stored), _now(), draft_id),
-    )
-    return get_draft(merge_id, draft_id)
+    with db.transaction() as conn:
+        _, draft_row = _fetch_draft_rows(conn, merge_id, draft_id)
+        if draft_row["status"] != DRAFT_OPEN:
+            raise DraftNotOpen(draft_id)
+        open_pointers = {c["pointer"] for c in json.loads(draft_row["conflicts"])}
+
+        # Validate the whole batch against the transaction's snapshot
+        # before touching stored: an unknown pointer or a malformed
+        # choice/value rejects everything and nothing is written.
+        for item in items:
+            pointer = item["pointer"]
+            if pointer not in open_pointers:
+                raise UnknownConflictPointer(pointer)
+            if item.get("choice") is not None and item.get("value_provided"):
+                raise InvalidResolution(
+                    f"resolution for {pointer!r} gives both 'choice' and 'value'"
+                )
+            if item.get("choice") is None and not item.get("value_provided"):
+                raise InvalidResolution(
+                    f"resolution for {pointer!r} needs 'choice' or 'value'"
+                )
+
+        stored = json.loads(draft_row["resolutions"])
+        for item in items:
+            pointer = item["pointer"]
+            if item.get("choice") is not None:
+                stored[pointer] = {"choice": item["choice"]}
+            else:
+                stored[pointer] = {"value": item["value"]}
+        now = _now()
+        conn.execute(
+            "UPDATE merge_drafts SET resolutions = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(stored), now, draft_id),
+        )
+        # Re-read inside the transaction: the returned view is the exact
+        # committed state of the draft (including the new updated_at).
+        updated_row = conn.execute(
+            "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        view = _draft_row_to_dict(updated_row)
+    return view
 
 
 def preview_draft(merge_id: str, draft_id: str) -> dict:
@@ -861,12 +926,7 @@ def commit_draft(merge_id: str, draft_id: str) -> dict:
     applied with exactly one revision bump and the draft is invalidated.
     """
     with db.transaction() as conn:
-        merge_row = _fetch_merge_row(conn, merge_id)
-        draft_row = conn.execute(
-            "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
-        ).fetchone()
-        if draft_row is None or draft_row["merge_id"] != merge_id:
-            raise DraftNotFound(draft_id)
+        merge_row, draft_row = _fetch_draft_rows(conn, merge_id, draft_id)
         if draft_row["status"] != DRAFT_OPEN:
             raise DraftNotOpen(draft_id)
         _require_pending_at_revision(merge_row, draft_row["base_revision"])

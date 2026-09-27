@@ -217,9 +217,26 @@ def transaction():
     The global lock is held for the whole block, so rows read inside cannot
     change underneath the caller; any exception rolls everything back and
     nothing is partially written.
+
+    The transaction opens with ``BEGIN IMMEDIATE`` so the connection holds
+    SQLite's reserved write lock from its first statement. A plain deferred
+    transaction only takes that lock at the first write: in WAL mode a
+    connection that read a snapshot before another connection committed can
+    then fail its write with ``SQLITE_BUSY_SNAPSHOT`` — and, more
+    importantly, would otherwise be reading rows it is about to blindly
+    overwrite (the lost-update window behind the draft-edit fix). Taking
+    the write lock up front makes read-modify-write transactions serialize
+    in lock order even across separate processes (the in-process lock alone
+    does not), so each transaction always builds on the latest committed
+    state.
     """
     with _lock:
         conn = connect()
+        # The shared connection is normally in deferred-isolation mode
+        # (Python opens an implicit transaction before DML); force one
+        # explicit IMMEDIATE transaction for this block and leave the
+        # connection with no open transaction on exit, exactly as before.
+        conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
         except Exception:
